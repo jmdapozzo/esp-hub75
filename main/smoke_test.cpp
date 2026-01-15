@@ -95,6 +95,10 @@ extern "C" void app_main() {
     driver.set_pixel(cx, y, 0, 255, 255);
   }
 
+  #ifdef CONFIG_HUB75_DOUBLE_BUFFER
+  driver.flip_buffer();
+  #endif
+
   ESP_LOGI(TAG, "Smoke test pattern displayed");
   ESP_LOGI(TAG, "Expected output:");
   ESP_LOGI(TAG, "  - Red square in top-left corner");
