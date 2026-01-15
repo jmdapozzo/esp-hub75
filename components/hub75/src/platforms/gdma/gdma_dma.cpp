@@ -41,6 +41,7 @@
 #include <driver/periph_ctrl.h>
 #endif
 #include <esp_heap_caps.h>
+#include <esp_cache.h>
 
 static const char *const TAG = "GdmaDma";
 
@@ -164,11 +165,16 @@ bool GdmaDma::init() {
 
   ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=false");
 
-  // Configure GDMA transfer for SRAM (not PSRAM)
+  // Configure GDMA transfer for PSRAM or SRAM based on CONFIG_SPIRAM
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
   gdma_transfer_config_t transfer_config = {
+#ifdef CONFIG_SPIRAM
+      .max_data_burst_size = 64,  // 64 bytes for PSRAM efficiency
+      .access_ext_mem = true      // Accessing external PSRAM
+#else
       .max_data_burst_size = 32,  // 32 bytes for SRAM
       .access_ext_mem = false     // Not accessing external memory
+#endif
   };
   gdma_config_transfer(dma_chan_, &transfer_config);
 #else
@@ -177,6 +183,12 @@ bool GdmaDma::init() {
       .psram_trans_align = 64,
   };
   gdma_set_transfer_ability(dma_chan_, &ability);
+#endif
+
+#ifdef CONFIG_SPIRAM
+  ESP_LOGI(TAG, "GDMA configured for PSRAM access (external memory)");
+#else
+  ESP_LOGI(TAG, "GDMA configured for SRAM access (internal memory)");
 #endif
 
   // Wait for any pending LCD operations
@@ -326,12 +338,31 @@ bool GdmaDma::allocate_row_buffers() {
   size_t total_buffer_size = num_rows_ * buffer_size_per_row;
 
   // Always allocate first buffer (buffer A, index 0)
-  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows", total_buffer_size, num_rows_);
-  dma_buffers_[0] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+#ifdef CONFIG_SPIRAM
+  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (PSRAM, 64-byte aligned)", total_buffer_size, num_rows_);
+  dma_buffers_[0] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
   if (!dma_buffers_[0]) {
-    ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A", total_buffer_size);
+    ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A in PSRAM", total_buffer_size);
     return false;
   }
+  // Zero-initialize the buffer
+  memset(dma_buffers_[0], 0, total_buffer_size);
+  // Verify buffer is actually in PSRAM range (ESP32-S3: 0x3C000000-0x3E000000)
+  uintptr_t addr = (uintptr_t)dma_buffers_[0];
+  if (addr >= 0x3C000000 && addr < 0x3E000000) {
+    ESP_LOGI(TAG, "Buffer A confirmed in PSRAM at address 0x%08X (aligned: %s)", 
+             (unsigned int)addr, (addr % 64 == 0) ? "YES" : "NO");
+  } else {
+    ESP_LOGE(TAG, "Buffer A NOT in PSRAM! Address: 0x%08X (may be SRAM fallback)", (unsigned int)addr);
+  }
+#else
+  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (SRAM)", total_buffer_size, num_rows_);
+  dma_buffers_[0] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+  if (!dma_buffers_[0]) {
+    ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A in SRAM", total_buffer_size);
+    return false;
+  }
+#endif
 
   // Allocate metadata array for buffer A
   row_buffers_[0] = new RowBitPlaneBuffer[num_rows_];
@@ -353,14 +384,34 @@ bool GdmaDma::allocate_row_buffers() {
 
   // Conditionally allocate second buffer (buffer B, index 1)
   if (config_.double_buffer) {
-    ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled)", total_buffer_size);
-    dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+#ifdef CONFIG_SPIRAM
+    ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled, PSRAM, 64-byte aligned)", total_buffer_size);
+    dma_buffers_[1] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
     if (!dma_buffers_[1]) {
-      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B", total_buffer_size);
+      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B in PSRAM", total_buffer_size);
       // Continue in single-buffer mode
       ESP_LOGW(TAG, "Continuing in single-buffer mode");
       return true;
     }
+    // Zero-initialize the buffer
+    memset(dma_buffers_[1], 0, total_buffer_size);
+    // Verify alignment
+    uintptr_t addr_b = (uintptr_t)dma_buffers_[1];
+    ESP_LOGI(TAG, "Buffer B at address 0x%08X (aligned: %s)", 
+             (unsigned int)addr_b, (addr_b % 64 == 0) ? "YES" : "NO");
+    if (addr_b % 64 != 0) {
+      ESP_LOGE(TAG, "CRITICAL: Buffer B not cache-aligned despite aligned_alloc!");
+    }
+#else
+    ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled, SRAM)", total_buffer_size);
+    dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+    if (!dma_buffers_[1]) {
+      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B in SRAM", total_buffer_size);
+      // Continue in single-buffer mode
+      ESP_LOGW(TAG, "Continuing in single-buffer mode");
+      return true;
+    }
+#endif
 
     // Allocate metadata array for buffer B
     row_buffers_[1] = new RowBitPlaneBuffer[num_rows_];
@@ -538,6 +589,12 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
   // Pre-compute bit plane stride (bytes between bit planes)
   const size_t bit_plane_stride = dma_width_ * 2;
 
+#ifdef CONFIG_SPIRAM
+  // Track which rows are modified (for cache flushing)
+  bool *modified_rows = new bool[num_rows_];
+  memset(modified_rows, 0, num_rows_ * sizeof(bool));
+#endif
+
   // Process each pixel
   const uint8_t *pixel_ptr = buffer;
   for (uint16_t dy = 0; dy < h; dy++) {
@@ -604,10 +661,33 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         buf[px] = word;
       }
 
+#ifdef CONFIG_SPIRAM
+      // Mark this row as modified (for cache flushing)
+      modified_rows[row] = true;
+#endif
+
       HUB75_PROFILE_STAGE(PROFILE_BITPLANE);
       HUB75_PROFILE_PIXEL();
     }
   }
+
+#ifdef CONFIG_SPIRAM
+  // Flush cache for all modified rows (avoid redundant coordinate transforms)
+  int flushed_count = 0;
+  for (int row = 0; row < num_rows_; row++) {
+    if (modified_rows[row]) {
+      esp_err_t err = esp_cache_msync(target_buffers[row].data, target_buffers[row].buffer_size, 
+                                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cache flush failed for row %d: %s", row, esp_err_to_name(err));
+      }
+      flushed_count++;
+    }
+  }
+  // Memory barrier to ensure cache flush completes before GDMA reads
+  __asm__ __volatile__("memw" : : : "memory");
+  delete[] modified_rows;
+#endif
 }
 
 void GdmaDma::clear() {
@@ -629,6 +709,16 @@ void GdmaDma::clear() {
       }
     }
   }
+
+#ifdef CONFIG_SPIRAM
+  // Flush cache after clearing for PSRAM
+  for (int row = 0; row < num_rows_; row++) {
+    esp_cache_msync(target_buffers[row].data, target_buffers[row].buffer_size, 
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+  }
+  // Memory barrier to ensure cache flush completes
+  __asm__ __volatile__("memw" : : : "memory");
+#endif
 }
 
 HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t r, uint8_t g, uint8_t b) {
@@ -677,6 +767,12 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
   const size_t bit_plane_stride = dma_width_ * 2;
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
+#ifdef CONFIG_SPIRAM
+  // Track which rows are modified (for cache flushing)
+  bool *modified_rows = new bool[num_rows_];
+  memset(modified_rows, 0, num_rows_ * sizeof(bool));
+#endif
+
   // Fill loop
   for (uint16_t dy = 0; dy < h; dy++) {
     for (uint16_t dx = 0; dx < w; dx++) {
@@ -718,8 +814,31 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
 
         buf[px] = word;
       }
+
+#ifdef CONFIG_SPIRAM
+      // Mark this row as modified (for cache flushing)
+      modified_rows[row] = true;
+#endif
     }
   }
+
+#ifdef CONFIG_SPIRAM
+  // Flush cache for all modified rows (avoid redundant coordinate transforms)
+  int flushed_count = 0;
+  for (int row = 0; row < num_rows_; row++) {
+    if (modified_rows[row]) {
+      esp_err_t err = esp_cache_msync(target_buffers[row].data, target_buffers[row].buffer_size, 
+                                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cache flush failed for row %d: %s", row, esp_err_to_name(err));
+      }
+      flushed_count++;
+    }
+  }
+  // Memory barrier to ensure cache flush completes before GDMA reads
+  __asm__ __volatile__("memw" : : : "memory");
+  delete[] modified_rows;
+#endif
 }
 
 void GdmaDma::flip_buffer() {
@@ -728,8 +847,11 @@ void GdmaDma::flip_buffer() {
     return;
   }
 
-  // Seamless descriptor chain redirection (no stop/start!)
-  //
+  // Flush cache to ensure GDMA reads latest pixel data from PSRAM
+  // Calculate total buffer size (all rows × bit planes × pixels × 2 bytes)
+  // Note: When using PSRAM (CONFIG_SPIRAM), cache coherency is handled automatically
+  // by the DMA subsystem when buffers are allocated with MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM
+  // and GDMA is configured with access_ext_mem = true. No manual cache flush needed.
   // DMA is continuously traversing a circular descriptor chain (front buffer).
   // To switch buffers without stopping DMA:
   //   1. Redirect old front's last descriptor to new buffer's first descriptor
@@ -867,6 +989,12 @@ void GdmaDma::initialize_blank_buffers() {
   for (auto &row_buffer : row_buffers_) {
     if (row_buffer) {
       initialize_buffer_internal(row_buffer);
+#ifdef CONFIG_SPIRAM
+      // Flush cache after initialization for PSRAM
+      for (int row = 0; row < num_rows_; row++) {
+        esp_cache_msync(row_buffer[row].data, row_buffer[row].buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+      }
+#endif
     }
   }
   ESP_LOGI(TAG, "Blank buffers initialized");
@@ -980,6 +1108,12 @@ void GdmaDma::set_brightness_oe() {
   for (auto &row_buffer : row_buffers_) {
     if (row_buffer) {
       set_brightness_oe_internal(row_buffer, brightness);
+#ifdef CONFIG_SPIRAM
+      // Flush cache after updating OE bits for PSRAM
+      for (int row = 0; row < num_rows_; row++) {
+        esp_cache_msync(row_buffer[row].data, row_buffer[row].buffer_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+      }
+#endif
     }
   }
 
