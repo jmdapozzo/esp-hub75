@@ -28,6 +28,9 @@ class Framebuffer;
  */
 class GdmaDma : public PlatformDma {
  public:
+  // EOF interrupt tracking (public member, must be first for proper initialization order)
+  volatile uint32_t eof_count_ = 0;  // Count of completed scans
+
   GdmaDma(const Hub75Config &config);
   ~GdmaDma();
 
@@ -165,6 +168,7 @@ class GdmaDma : public PlatformDma {
   // Brightness control (implementation of base class interface)
   uint8_t basis_brightness_;  // 1-255
   float intensity_;           // 0.0-1.0
+
 };
 
 }  // namespace hub75

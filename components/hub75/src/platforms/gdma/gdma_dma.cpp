@@ -100,13 +100,40 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       active_idx_(0),
       descriptor_count_(0),
       basis_brightness_(config.brightness),  // Use config value (default: 128)
-      intensity_(1.0f) {
+      intensity_(1.0f)
+{
   // Zero-copy architecture: DMA buffers ARE the display memory
   // Note: For four-scan panels, dma_width_ is doubled and num_rows_ is halved
   // to match the physical shift register layout
 }
 
 GdmaDma::~GdmaDma() { GdmaDma::shutdown(); }
+
+// Static EOF callback for descriptor chain completion
+static bool IRAM_ATTR gdma_eof_callback(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data) {
+  GdmaDma *self = (GdmaDma *)user_data;
+  // Use atomic read-modify-write to avoid volatile++ deprecation warning
+  uint32_t count = self->eof_count_;
+  self->eof_count_ = count + 1;
+
+  if (event_data->flags.abnormal_eof) {
+    // Abnormal EOF - log warning
+    ESP_DRAM_LOGW(TAG, "GDMA abnormal EOF detected at descriptor address: 0x%08x, eof_count=%u",
+                  (unsigned int)event_data->rx_eof_desc_addr, self->eof_count_);
+  }
+
+  ESP_DRAM_LOGW(TAG, "GDMA EOF callback triggered, total scans completed: %u", self->eof_count_);
+
+  return false;  // No task yield needed
+}
+
+// Static error callback for descriptor errors
+static bool IRAM_ATTR gdma_err_callback(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data) {
+  // Log descriptor error - critical for debugging PSRAM access issues
+  ESP_DRAM_LOGE(TAG, "GDMA descriptor error detected! Check PSRAM access and descriptor configuration");
+  
+  return false;  // No task yield needed
+}
 
 bool GdmaDma::init() {
   ESP_LOGI(TAG, "Initializing LCD_CAM peripheral with GDMA...");
@@ -155,11 +182,30 @@ bool GdmaDma::init() {
   // Connect GDMA to LCD peripheral
   gdma_connect(dma_chan_, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
 
+  // Register EOF callback to restart DMA after each scan (required for PSRAM continuous operation)
+  gdma_tx_event_callbacks_t cbs = {
+    .on_trans_eof = gdma_eof_callback,
+    .on_descr_err = gdma_err_callback
+  };
+  err = gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to register GDMA callbacks: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "Try disabling other peripherals or using shared interrupts in menuconfig");
+    return false;
+  }
+  ESP_LOGI(TAG, "GDMA EOF callback registered for continuous scanning");
+
   // Configure GDMA strategy
+  // CRITICAL: For PSRAM (external memory), auto_update_desc MUST be true for continuous operation!
+  // For SRAM, we can use false to avoid descriptor writeback overhead
   // owner_check = false: Static descriptors, no dynamic ownership handshaking needed
-  // auto_update_desc = false: No descriptor writeback - prevents corruption with infinite ring
+#ifdef CONFIG_SPIRAM
   gdma_strategy_config_t strategy_config = {.owner_check = false,
-                                            .auto_update_desc = false
+                                            .auto_update_desc = true  // REQUIRED for PSRAM continuous loop!
+#else
+  gdma_strategy_config_t strategy_config = {.owner_check = false,
+                                            .auto_update_desc = false  // SRAM can skip writeback
+#endif
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
                                             ,
                                             .eof_till_data_popped = false
@@ -167,7 +213,11 @@ bool GdmaDma::init() {
   };
   gdma_apply_strategy(dma_chan_, &strategy_config);
 
+#ifdef CONFIG_SPIRAM
+  ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=true (PSRAM requires auto-update)");
+#else
   ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=false");
+#endif
 
   // Configure GDMA transfer for PSRAM or SRAM based on CONFIG_SPIRAM
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
@@ -195,6 +245,8 @@ bool GdmaDma::init() {
   ESP_LOGI(TAG, "GDMA configured for SRAM access (internal memory)");
 #endif
 
+  ESP_LOGI(TAG, "GDMA TX event callbacks registered");
+
   // Wait for any pending LCD operations
   while (LCD_CAM.lcd_user.lcd_start)
     ;
@@ -206,10 +258,10 @@ bool GdmaDma::init() {
   LCD_CAM.lcd_user.lcd_update = 1;       // Update registers
   LCD_CAM.lcd_misc.lcd_afifo_reset = 1;  // Reset LCD TX FIFO
 
-  // Note: No EOF callback needed with descriptor-chain approach
-  // The descriptor chain encodes all timing via repetition counts
+  // Note: EOF callback handles continuous operation
+  // The callback restarts DMA after each descriptor chain completion
 
-  ESP_LOGI(TAG, "GDMA EOF callback registered successfully");
+  ESP_LOGI(TAG, "GDMA EOF callback configured for descriptor-chain restart");
   ESP_LOGI(TAG, "Panel config: %dx%d pixels, %dx%d layout, virtual: %dx%d", panel_width_, panel_height_, layout_cols_,
            layout_rows_, virtual_width_, virtual_height_);
   ESP_LOGI(TAG, "DMA config: %dx%d (width x rows), four-scan: %s", dma_width_, num_rows_,
@@ -346,7 +398,7 @@ bool GdmaDma::allocate_row_buffers() {
   // Always allocate first buffer (buffer A, index 0)
 #ifdef CONFIG_SPIRAM
   ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (PSRAM, 64-byte aligned)", total_buffer_size, num_rows_);
-  dma_buffers_[0] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+  dma_buffers_[0] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_SPIRAM);
   if (!dma_buffers_[0]) {
     ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A in PSRAM", total_buffer_size);
     return false;
@@ -392,7 +444,7 @@ bool GdmaDma::allocate_row_buffers() {
   if (config_.double_buffer) {
 #ifdef CONFIG_SPIRAM
     ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled, PSRAM, 64-byte aligned)", total_buffer_size);
-    dma_buffers_[1] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+    dma_buffers_[1] = (uint8_t *) heap_caps_aligned_alloc(64, total_buffer_size, MALLOC_CAP_SPIRAM);
     if (!dma_buffers_[1]) {
       ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B in PSRAM", total_buffer_size);
       // Continue in single-buffer mode
@@ -564,6 +616,8 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
   RowBitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
   if (!target_buffers || !lut_ || !buffer) [[unlikely]] {
+    ESP_LOGE(TAG, "draw_pixels: EARLY RETURN - target_buffers=%p, lut_=%p, buffer=%p", 
+             target_buffers, lut_, buffer);
     return;
   }
 
@@ -594,12 +648,6 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
 
   // Pre-compute bit plane stride (bytes between bit planes)
   const size_t bit_plane_stride = dma_width_ * 2;
-
-#ifdef CONFIG_SPIRAM
-  // Track which rows are modified (for cache flushing)
-  bool *modified_rows = new bool[num_rows_];
-  memset(modified_rows, 0, num_rows_ * sizeof(bool));
-#endif
 
   // Process each pixel
   const uint8_t *pixel_ptr = buffer;
@@ -667,33 +715,13 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         buf[px] = word;
       }
 
-#ifdef CONFIG_SPIRAM
-      // Mark this row as modified (for cache flushing)
-      modified_rows[row] = true;
-#endif
-
       HUB75_PROFILE_STAGE(PROFILE_BITPLANE);
       HUB75_PROFILE_PIXEL();
     }
   }
 
-#ifdef CONFIG_SPIRAM
-  // Flush cache for all modified rows (avoid redundant coordinate transforms)
-  int flushed_count = 0;
-  for (int row = 0; row < num_rows_; row++) {
-    if (modified_rows[row]) {
-      esp_err_t err = esp_cache_msync(target_buffers[row].data, target_buffers[row].buffer_size, 
-                                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-      if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Cache flush failed for row %d: %s", row, esp_err_to_name(err));
-      }
-      flushed_count++;
-    }
-  }
-  // Memory barrier to ensure cache flush completes before GDMA reads
-  __asm__ __volatile__("memw" : : : "memory");
-  delete[] modified_rows;
-#endif
+  // Note: Cache flush moved to flip_buffer() for batching efficiency
+  // LVGL draws many pixels then calls flip_buffer(), so we flush once per frame
 }
 
 void GdmaDma::clear() {
@@ -773,12 +801,6 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
   const size_t bit_plane_stride = dma_width_ * 2;
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
-#ifdef CONFIG_SPIRAM
-  // Track which rows are modified (for cache flushing)
-  bool *modified_rows = new bool[num_rows_];
-  memset(modified_rows, 0, num_rows_ * sizeof(bool));
-#endif
-
   // Fill loop
   for (uint16_t dy = 0; dy < h; dy++) {
     for (uint16_t dx = 0; dx < w; dx++) {
@@ -820,44 +842,45 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
 
         buf[px] = word;
       }
-
-#ifdef CONFIG_SPIRAM
-      // Mark this row as modified (for cache flushing)
-      modified_rows[row] = true;
-#endif
     }
   }
 
-#ifdef CONFIG_SPIRAM
-  // Flush cache for all modified rows (avoid redundant coordinate transforms)
-  int flushed_count = 0;
-  for (int row = 0; row < num_rows_; row++) {
-    if (modified_rows[row]) {
-      esp_err_t err = esp_cache_msync(target_buffers[row].data, target_buffers[row].buffer_size, 
-                                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-      if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Cache flush failed for row %d: %s", row, esp_err_to_name(err));
-      }
-      flushed_count++;
-    }
-  }
-  // Memory barrier to ensure cache flush completes before GDMA reads
-  __asm__ __volatile__("memw" : : : "memory");
-  delete[] modified_rows;
-#endif
+  // Note: Cache flush moved to flip_buffer() for batching efficiency
 }
 
 void GdmaDma::flip_buffer() {
-  // Single buffer mode: no-op (both indices point to buffer 0)
+#ifdef CONFIG_SPIRAM
+  // Flush cache for ALL rows after CPU drawing is complete
+  // This batches all cache flushes into one operation after LVGL finishes drawing
+  RowBitPlaneBuffer *active_buffers = row_buffers_[active_idx_];
+  if (active_buffers) {
+    ESP_LOGW(TAG, "flip_buffer: flushing %d rows to PSRAM (no GDMA stop/restart - testing continuous operation)", num_rows_);
+    for (int row = 0; row < num_rows_; row++) {
+      // Writeback: flush dirty cache lines to PSRAM
+      esp_err_t err = esp_cache_msync(active_buffers[row].data, active_buffers[row].buffer_size,
+                                      ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "flip_buffer: cache writeback failed for row %d: %s", row, esp_err_to_name(err));
+      }
+      
+      // Invalidate: ensure subsequent reads come from PSRAM, not stale cache
+      err = esp_cache_msync(active_buffers[row].data, active_buffers[row].buffer_size,
+                           ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "flip_buffer: cache invalidate failed for row %d: %s", row, esp_err_to_name(err));
+      }
+    }
+    // Memory barrier to ensure cache operations complete before GDMA reads
+    __asm__ __volatile__("memw" : : : "memory");
+    ESP_LOGD(TAG, "flip_buffer: cache flush complete");
+  }
+#endif
+
+  // Single buffer mode: no buffer swap needed (both indices point to buffer 0)
   if (!row_buffers_[1] || !descriptors_[1]) {
     return;
   }
 
-  // Flush cache to ensure GDMA reads latest pixel data from PSRAM
-  // Calculate total buffer size (all rows × bit planes × pixels × 2 bytes)
-  // Note: When using PSRAM (CONFIG_SPIRAM), cache coherency is handled automatically
-  // by the DMA subsystem when buffers are allocated with MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM
-  // and GDMA is configured with access_ext_mem = true. No manual cache flush needed.
   // DMA is continuously traversing a circular descriptor chain (front buffer).
   // To switch buffers without stopping DMA:
   //   1. Redirect old front's last descriptor to new buffer's first descriptor
@@ -1132,7 +1155,9 @@ bool GdmaDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, dma_de
   }
 
   size_t pixels_per_bitplane = dma_width_;              // DMA buffer width per bit plane
+  ESP_LOGI(TAG, "  Pixels per bit plane: %zu", pixels_per_bitplane);
   size_t bytes_per_bitplane = pixels_per_bitplane * 2;  // uint16_t = 2 bytes
+  ESP_LOGI(TAG, "  Bytes per bit plane: %zu", bytes_per_bitplane);
 
   // Link descriptors with BCM repetitions
   size_t desc_idx = 0;
@@ -1164,9 +1189,10 @@ bool GdmaDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, dma_de
     }
   }
 
-  // Last descriptor loops back to first (continuous refresh)
+  // Last descriptor loops back to first AND triggers EOF interrupt for debugging
+  // EOF callback will track how many complete scans occur
   descriptors[descriptor_count_ - 1].next = &descriptors[0];
-  descriptors[descriptor_count_ - 1].dw0.suc_eof = 1;  // Optional: EOF once per frame
+  descriptors[descriptor_count_ - 1].dw0.suc_eof = 1;  // Trigger EOF callback each scan
 
   return true;
 }
@@ -1209,8 +1235,9 @@ bool GdmaDma::build_descriptor_chain() {
   }
 
   // Always allocate first descriptor chain (buffer 0)
-  // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-  descriptors_[0] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA);
+  // CRITICAL: Descriptors MUST be in internal SRAM, even when buffers are in PSRAM!
+  // GDMA hardware reads descriptors from SRAM, then follows buffer pointers (which may point to PSRAM)
+  descriptors_[0] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
   if (!descriptors_[0]) {
     ESP_LOGE(TAG, "Failed to allocate %zu descriptors [0] (%zu bytes) in DMA memory", descriptor_count_,
              total_descriptor_bytes);
@@ -1225,8 +1252,8 @@ bool GdmaDma::build_descriptor_chain() {
 
   // Conditionally allocate second descriptor chain (buffer 1)
   if (config_.double_buffer) {
-    // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-    descriptors_[1] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA);
+    // CRITICAL: Descriptors in internal SRAM (same reason as buffer 0)
+    descriptors_[1] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!descriptors_[1]) {
       ESP_LOGE(TAG, "Failed to allocate %zu descriptors [1] (%zu bytes) in DMA memory", descriptor_count_,
                total_descriptor_bytes);
