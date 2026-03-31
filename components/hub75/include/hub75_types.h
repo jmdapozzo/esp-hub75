@@ -77,6 +77,7 @@ enum class Hub75ShiftDriver {
   FM6126A,   // FM6126A / ICN2038S (very common in modern panels!)
   ICN2038S,  // Alias for FM6126A
   FM6124,    // FM6124 family
+  FM6373,    // FM6373 / FM6363 family (LE-length command encoding)
   MBI5124,   // MBI5124 (requires positive clock edge)
   DP3246     // DP3246 (special timing requirements)
 };

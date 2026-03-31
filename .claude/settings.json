@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/jmdapozzo/Projects/esp-hub75/**)",
+      "Bash(pdftotext /Users/jmdapozzo/Projects/esp-hub75/docs/fm6373/FM6363_Programming_Guide_v0.1_en.pdf -)",
+      "Bash(python3:*)"
+    ]
+  }
+}

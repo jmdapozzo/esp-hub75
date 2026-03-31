@@ -99,6 +99,8 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       front_idx_(0),
       active_idx_(0),
       descriptor_count_(0),
+      fm6373_mode_(config.shift_driver == Hub75ShiftDriver::FM6373),
+      fm6373_cmd_bufs_{nullptr, nullptr, nullptr},
       basis_brightness_(config.brightness),  // Use config value (default: 128)
       intensity_(1.0f)
 {
@@ -117,12 +119,9 @@ static bool IRAM_ATTR gdma_eof_callback(gdma_channel_handle_t dma_chan, gdma_eve
   self->eof_count_ = count + 1;
 
   if (event_data->flags.abnormal_eof) {
-    // Abnormal EOF - log warning
     ESP_DRAM_LOGW(TAG, "GDMA abnormal EOF detected at descriptor address: 0x%08x, eof_count=%u",
                   (unsigned int)event_data->rx_eof_desc_addr, self->eof_count_);
   }
-
-  ESP_DRAM_LOGW(TAG, "GDMA EOF callback triggered, total scans completed: %u", self->eof_count_);
 
   return false;  // No task yield needed
 }
@@ -489,6 +488,20 @@ bool GdmaDma::allocate_row_buffers() {
              buffer_size_per_row, total_buffer_size);
   }
 
+  // Allocate FM6373 per-frame command buffers (shared by both descriptor chains)
+  if (fm6373_mode_) {
+    const size_t cmd_buf_bytes = dma_width_ * sizeof(uint16_t);
+    for (int i = 0; i < 3; i++) {
+      fm6373_cmd_bufs_[i] =
+          (uint16_t *) heap_caps_calloc(1, cmd_buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+      if (!fm6373_cmd_bufs_[i]) {
+        ESP_LOGE(TAG, "Failed to allocate FM6373 command buffer %d (%zu bytes)", i, cmd_buf_bytes);
+        return false;
+      }
+    }
+    ESP_LOGI(TAG, "FM6373 command buffers allocated (%zu bytes each)", cmd_buf_bytes);
+  }
+
   return true;
 }
 
@@ -541,6 +554,13 @@ void GdmaDma::shutdown() {
     gdma_disconnect(dma_chan_);
     gdma_del_channel(dma_chan_);
     dma_chan_ = nullptr;
+  }
+
+  // Free FM6373 command buffers
+  for (int i = 0; i < 3; i++) {
+    if (fm6373_cmd_bufs_[i]) {
+      heap_caps_free(fm6373_cmd_bufs_[i]);
+    }
   }
 
   // Free all allocated resources (using array structure)
@@ -1008,6 +1028,29 @@ void GdmaDma::initialize_buffer_internal(RowBitPlaneBuffer *buffers) {
   }
 }
 
+void GdmaDma::initialize_fm6373_cmd_buffers() {
+  // FM6373 uses LE-length command encoding: the number of rising CLK edges while
+  // LAT=1 determines the command type. Three commands per frame:
+  //   [0] VSYNC   — 3  CLK edges with LAT=1: synchronise / start frame
+  //   [1] CMD_11  — 11 CLK edges with LAT=1: enable outputs (EN_OP equivalent)
+  //   [2] PRE_ACT — 14 CLK edges with LAT=1: write-enable registers
+  // RGB data is all zero; OE=1 (blank) throughout command rows to avoid LED
+  // flicker during the non-display portion of the command sequence.
+  static constexpr int CMD_CLKS[3] = {3, 11, 14};
+
+  for (int i = 0; i < 3; i++) {
+    if (!fm6373_cmd_bufs_[i]) continue;
+    for (uint16_t x = 0; x < dma_width_; x++) {
+      uint16_t word = (1 << OE_BIT);  // OE=1 (blank), RGB=0, ADDR=0
+      if (x >= dma_width_ - CMD_CLKS[i]) {
+        word |= (1 << LAT_BIT);  // Assert LAT for the last CMD_CLKS[i] pixels
+      }
+      fm6373_cmd_bufs_[i][x] = word;
+    }
+  }
+  ESP_LOGI(TAG, "FM6373 command buffers initialized (VSYNC=3, CMD_11=11, PRE_ACT=14 CLK edges)");
+}
+
 void GdmaDma::initialize_blank_buffers() {
   if (!row_buffers_[0]) {
     ESP_LOGE(TAG, "Row buffers not allocated");
@@ -1026,6 +1069,11 @@ void GdmaDma::initialize_blank_buffers() {
 #endif
     }
   }
+
+  if (fm6373_mode_) {
+    initialize_fm6373_cmd_buffers();
+  }
+
   ESP_LOGI(TAG, "Blank buffers initialized");
 }
 
@@ -1159,8 +1207,23 @@ bool GdmaDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, dma_de
   size_t bytes_per_bitplane = pixels_per_bitplane * 2;  // uint16_t = 2 bytes
   ESP_LOGI(TAG, "  Bytes per bit plane: %zu", bytes_per_bitplane);
 
-  // Link descriptors with BCM repetitions
+  // Prepend FM6373 per-frame command descriptors (VSYNC, CMD_11, PRE_ACT)
+  // Both descriptor chains share the same command buffers (identical content)
   size_t desc_idx = 0;
+  if (fm6373_mode_) {
+    for (int i = 0; i < 3; i++) {
+      dma_descriptor_t *const desc = &descriptors[desc_idx];
+      desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+      desc->dw0.suc_eof = 0;
+      desc->dw0.size = dma_width_ * 2;
+      desc->dw0.length = dma_width_ * 2;
+      desc->buffer = fm6373_cmd_bufs_[i];
+      desc->next = &descriptors[desc_idx + 1];
+      desc_idx++;
+    }
+  }
+
+  // Link descriptors with BCM repetitions
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
       uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
@@ -1201,7 +1264,8 @@ bool GdmaDma::build_descriptor_chain() {
   // Calculate total descriptors needed WITH BCM repetitions
   // For bits <= lsbMsbTransitionBit: 1 descriptor each (base timing)
   // For bits > lsbMsbTransitionBit: 2^(bit - lsbMsbTransitionBit - 1) descriptors each
-  descriptor_count_ = 0;
+  // FM6373 adds 3 extra command descriptors (VSYNC, CMD_11, PRE_ACT) at frame start
+  descriptor_count_ = fm6373_mode_ ? 3 : 0;
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
       if (bit <= lsbMsbTransitionBit_) {

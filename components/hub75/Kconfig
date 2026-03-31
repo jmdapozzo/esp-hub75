@@ -195,6 +195,12 @@ menu "HUB75 RGB LED Matrix Driver"
             config HUB75_DRIVER_FM6124
                 bool "FM6124"
 
+            config HUB75_DRIVER_FM6373
+                bool "FM6373 / FM6363"
+                help
+                    FM6373 / FM6363 family driver using LE-length command encoding.
+                    Required for panels with FM6373 chips (startup init via GPIO).
+
             config HUB75_DRIVER_MBI5124
                 bool "MBI5124 (Requires Inverted Clock)"
                 help

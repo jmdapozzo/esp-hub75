@@ -41,6 +41,8 @@ static inline Hub75Config getMenuConfigSettings() {
   config.shift_driver = Hub75ShiftDriver::FM6126A;
 #elif defined(CONFIG_HUB75_DRIVER_FM6124)
   config.shift_driver = Hub75ShiftDriver::FM6124;
+#elif defined(CONFIG_HUB75_DRIVER_FM6373)
+  config.shift_driver = Hub75ShiftDriver::FM6373;
 #elif defined(CONFIG_HUB75_DRIVER_MBI5124)
   config.shift_driver = Hub75ShiftDriver::MBI5124;
 #elif defined(CONFIG_HUB75_DRIVER_DP3246)

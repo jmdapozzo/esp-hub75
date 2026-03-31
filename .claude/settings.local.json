@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F',' 'NR>=65200 && NR<=65360' /Users/jmdapozzo/Projects/esp-hub75/docs/fm6373/HUB75_32x32_FM6373_BLANK_INIT.csv)",
+      "Read(//Users/jmdapozzo/Projects/esp-hub75/**)"
+    ]
+  }
+}

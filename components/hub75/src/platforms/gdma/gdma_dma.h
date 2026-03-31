@@ -118,6 +118,7 @@ class GdmaDma : public PlatformDma {
   bool allocate_row_buffers();
   bool validate_brightness_config();  // Validate safety margins for brightness OE configuration
   void initialize_blank_buffers();    // Initialize DMA buffers with control bits only
+  void initialize_fm6373_cmd_buffers();                                             // Initialize FM6373 per-frame command buffers
   void initialize_buffer_internal(RowBitPlaneBuffer *buffers);                      // Helper: initialize one buffer set
   void set_brightness_oe();                                                         // Set OE bits for BCM control
   void set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness);  // Helper: set OE for one buffer
@@ -164,6 +165,10 @@ class GdmaDma : public PlatformDma {
   int active_idx_;  // CPU draws to buffers[active_idx_]
 
   size_t descriptor_count_;  // Number of descriptors per chain
+
+  // FM6373 per-frame command support
+  const bool fm6373_mode_;        // true if shift_driver == FM6373
+  uint16_t *fm6373_cmd_bufs_[3];  // VSYNC (3), CMD_11 (11), PRE_ACT (14) buffers; nullptr if not FM6373
 
   // Brightness control (implementation of base class interface)
   uint8_t basis_brightness_;  // 1-255

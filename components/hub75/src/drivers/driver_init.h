@@ -23,6 +23,7 @@ class DriverInit {
 
  private:
   static void fm6126a_init(const Hub75Pins &pins, uint16_t pixels_per_row);
+  static void fm6373_init(const Hub75Pins &pins, uint16_t pixels_per_row);
   static void dp3246_init(const Hub75Pins &pins, uint16_t pixels_per_row);
 };
 
