@@ -55,6 +55,9 @@ extern "C" void app_main() {
   driver.set_pixel(0, 8, 0, 0, 255);
   driver.set_pixel(0, 16, 0, 255, 0);
   driver.set_pixel(0, 24, 255, 0, 0);
+  driver.set_pixel(16, 0, 0, 0, 255);
+  driver.set_pixel(32, 0, 0, 255, 0);
+  driver.set_pixel(48, 0, 255, 0, 0);
   driver.flip_buffer();
   // #endif
 
@@ -64,6 +67,9 @@ extern "C" void app_main() {
   ESP_LOGI(TAG, "  - Blue pixel at 0,8");
   ESP_LOGI(TAG, "  - Green pixel at 0,16");
   ESP_LOGI(TAG, "  - Red pixel at 0,24");
+  ESP_LOGI(TAG, "  - Blue pixel at 16,0");
+  ESP_LOGI(TAG, "  - Green pixel at 32,0");
+  ESP_LOGI(TAG, "  - Red pixel at 48,0");
 
   // Idle loop (display continues refresh via DMA)
   ESP_LOGI(TAG, "Smoke test complete. Display will remain static.");
