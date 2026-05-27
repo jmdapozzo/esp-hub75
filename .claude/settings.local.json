@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(awk -F',' 'NR>=65200 && NR<=65360' /Users/jmdapozzo/Projects/esp-hub75/docs/fm6373/HUB75_32x32_FM6373_BLANK_INIT.csv)",
-      "Read(//Users/jmdapozzo/Projects/esp-hub75/**)"
+      "Read(//Users/jmdapozzo/Projects/esp-hub75/**)",
+      "Bash(sed -i '' 's/CONFIG_HUB75_WIRING_STANDARD=y/# CONFIG_HUB75_WIRING_STANDARD is not set/' /Users/jmdapozzo/Projects/esp-hub75/sdkconfig)",
+      "Bash(sed -i '' 's/# CONFIG_HUB75_WIRING_SCAN_1_8_32PX is not set/CONFIG_HUB75_WIRING_SCAN_1_8_32PX=y/' /Users/jmdapozzo/Projects/esp-hub75/sdkconfig)",
+      "Bash(cmake --build build --target app)"
     ]
   }
 }
